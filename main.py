@@ -18,6 +18,7 @@ from .notifier import (
 from .market_data import get_market_context
 from .logger import log_system, log_error, journal_entry
 from . import state as store
+from . import sheets_writer as sheets
 
 
 def run_poll_cycle() -> Dict[str, Any]:
@@ -56,9 +57,14 @@ def run_poll_cycle() -> Dict[str, Any]:
     # ── 2. Filter qualifying trades ───────────────────────────────
     qualifying = []
     for trade in new_trades:
-        # Store all detected filings
+        # Store all detected filings (local + Sheets)
         store.append_record("filings.json", trade.to_dict())
         sys_state.total_filings_detected += 1
+
+        try:
+            sheets.log_filing(trade)
+        except Exception as e:
+            log_error(f"Sheets log_filing error: {e}")
 
         # Only open-market purchases and sales
         if trade.transaction_code not in config.QUALIFYING_TX_CODES:
@@ -78,6 +84,12 @@ def run_poll_cycle() -> Dict[str, Any]:
             store.append_record("signals.json", signal.to_dict())
             sys_state.total_signals_generated += 1
             signals.append(signal)
+
+            try:
+                sheets.log_signal(signal)
+            except Exception as e:
+                log_error(f"Sheets log_signal error: {e}")
+
         except Exception as e:
             log_error(f"Scoring error for {trade.ticker}: {e}")
             summary["errors"].append(f"Scoring {trade.ticker}: {str(e)}")
@@ -108,11 +120,40 @@ def run_poll_cycle() -> Dict[str, Any]:
         closed = portfolio.check_all_exits()
         summary["positions_closed"] = len(closed)
         sys_state.total_trades_closed += len(closed)
+
+        # Log closed positions to Sheets
+        for p in closed:
+            try:
+                sheets.log_closed_position(p)
+            except Exception as e:
+                log_error(f"Sheets log_closed error: {e}")
+
     except Exception as e:
         log_error(f"Exit check error: {e}")
         summary["errors"].append(f"Exit checks: {str(e)}")
 
-    # ── 6. Update system state ────────────────────────────────────
+    # ── 6. Sync open positions to Sheets ──────────────────────────
+    try:
+        sheets.sync_open_positions(portfolio.positions)
+    except Exception as e:
+        log_error(f"Sheets sync_open_positions error: {e}")
+
+    # ── 7. Log portfolio snapshot to Sheets ───────────────────────
+    try:
+        port_summary = portfolio.get_summary()
+        perf = portfolio.get_performance_metrics()
+        win_rate = perf.get("win_rate", 0) if isinstance(perf, dict) else 0
+        port_summary["win_rate"] = win_rate
+
+        days_elapsed = (now - datetime.fromisoformat(
+            sys_state.system_start if sys_state.system_start else now.isoformat()
+        )).days
+
+        sheets.log_portfolio_snapshot(port_summary, days_elapsed)
+    except Exception as e:
+        log_error(f"Sheets portfolio snapshot error: {e}")
+
+    # ── 8. Update system state ────────────────────────────────────
     sys_state.last_poll_time = now.isoformat()
     sys_state.last_heartbeat = now.isoformat()
     sys_state.capital_remaining = portfolio.cash
@@ -122,7 +163,19 @@ def run_poll_cycle() -> Dict[str, Any]:
     sys_state.experiment_day = days_elapsed
     store.save_state(sys_state)
 
-    # ── 7. Journal entry if anything notable ──────────────────────
+    # ── 9. Log system event to Sheets ─────────────────────────────
+    try:
+        sheets.log_system_event(
+            "Poll Cycle Complete",
+            f"Filings={summary['new_filings']}, Qualifying={summary['qualifying_trades']}, "
+            f"Signals={summary['signals_generated']}, Trades={summary['trades_opened']}, "
+            f"Closed={summary['positions_closed']}, Errors={len(summary['errors'])}",
+            sys_state,
+        )
+    except Exception as e:
+        log_error(f"Sheets system event error: {e}")
+
+    # ── 10. Journal entry if anything notable ─────────────────────
     if summary["signals_generated"] > 0 or summary["positions_closed"] > 0:
         journal_entry(
             f"Cycle: {summary['new_filings']} filings, "
@@ -205,7 +258,7 @@ def run_health_check() -> Dict[str, Any]:
     if sys_state.last_poll_time:
         last_poll = datetime.fromisoformat(sys_state.last_poll_time)
         hours_since = (now - last_poll).total_seconds() / 3600
-        if hours_since > 2:
+        if hours_since > 26:  # Allow for weekends
             issues.append(f"No poll in {hours_since:.1f} hours")
 
     # Check error rate

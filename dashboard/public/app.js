@@ -1,11 +1,23 @@
 /* ============================================================
    INSIDER TRADE MONITOR — Frontend Application
-   Auto-refreshes every 30 seconds
+   Reads live data from Google Sheets (public CSV export)
+   Auto-refreshes every 60 seconds
    ============================================================ */
 
-const REFRESH_INTERVAL = 30; // seconds
+const SPREADSHEET_ID = '10_2yzOFxMic_lBAJLHwLEkg_1N8lqoQBEpNSUMRfef4';
+const REFRESH_INTERVAL = 60; // seconds
 let countdown = REFRESH_INTERVAL;
 let refreshTimer = null;
+
+// Sheet GIDs — set after first metadata fetch, or use names via CSV export
+const SHEET_NAMES = {
+  filings: 'Filings',
+  signals: 'Signals',
+  openPositions: 'Open Positions',
+  closedPositions: 'Closed Positions',
+  portfolio: 'Portfolio Snapshots',
+  system: 'System Log',
+};
 
 // ========== Helpers ==========
 
@@ -51,18 +63,11 @@ function timeAgo(dateStr) {
   return days + 'd ago';
 }
 
-function shortTime(dateStr) {
-  if (!dateStr) return '—';
-  try {
-    const d = new Date(dateStr);
-    return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
-  } catch { return '—'; }
-}
-
 function shortDate(dateStr) {
   if (!dateStr) return '—';
   try {
     const d = new Date(dateStr);
+    if (isNaN(d)) return dateStr.substring(0, 16);
     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' ' +
            d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
   } catch { return '—'; }
@@ -78,7 +83,6 @@ function classificationBadge(cls) {
   if (c === 'REPLICATE') return '<span class="badge badge--replicate">REPLICATE</span>';
   if (c === 'WATCHLIST') return '<span class="badge badge--watchlist">WATCHLIST</span>';
   if (c === 'REJECT') return '<span class="badge badge--reject">REJECT</span>';
-  if (c === 'SKIP') return '<span class="badge badge--skip">SKIP</span>';
   return '<span class="badge badge--reject">' + (cls || '—') + '</span>';
 }
 
@@ -102,152 +106,176 @@ function scoreBar(score, max = 100) {
 
 function txnAction(code) {
   const c = (code || '').toUpperCase();
-  if (c === 'P' || c === 'BUY' || c === 'A') return { label: 'BUY', cls: 'filing-item__action--buy' };
-  if (c === 'S' || c === 'SELL' || c === 'D' || c === 'F') return { label: 'SELL', cls: 'filing-item__action--sell' };
+  if (c === 'P') return { label: 'BUY', cls: 'filing-item__action--buy' };
+  if (c === 'S') return { label: 'SELL', cls: 'filing-item__action--sell' };
   return { label: code || '—', cls: 'filing-item__action--other' };
 }
 
-// ========== API Fetch ==========
+// ========== Google Sheets CSV Fetch ==========
 
-async function fetchJSON(url) {
+async function fetchSheet(sheetName) {
+  const url = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(sheetName)}`;
   try {
     const res = await fetch(url);
-    if (!res.ok) return null;
-    return await res.json();
-  } catch { return null; }
+    const text = await res.text();
+    // Response is wrapped in google.visualization.Query.setResponse({...})
+    const jsonStr = text.match(/google\.visualization\.Query\.setResponse\(([\s\S]+)\);?/);
+    if (!jsonStr) return [];
+    const data = JSON.parse(jsonStr[1]);
+    const cols = data.table.cols.map(c => c.label || '');
+    const rows = (data.table.rows || []).map(r => {
+      const obj = {};
+      r.c.forEach((cell, i) => {
+        if (cols[i]) {
+          obj[cols[i]] = cell ? (cell.v != null ? cell.v : (cell.f || '')) : '';
+        }
+      });
+      return obj;
+    });
+    return rows;
+  } catch (e) {
+    console.error(`Failed to fetch sheet "${sheetName}":`, e);
+    return [];
+  }
 }
 
 // ========== Render Functions ==========
 
-function renderState(state) {
-  if (!state) return;
+function renderState(systemLogs, portfolioSnapshots) {
+  // Get latest system log entry
+  const latest = systemLogs.length > 0 ? systemLogs[systemLogs.length - 1] : null;
+  // Get latest portfolio snapshot
+  const latestPort = portfolioSnapshots.length > 0 ? portfolioSnapshots[portfolioSnapshots.length - 1] : null;
 
   // Experiment day
-  const day = state.experiment_day || '—';
-  const total = state.experiment_total_days || 90;
-  $('experimentDay').textContent = `Day ${day}/${total}`;
+  const day = latestPort ? (latestPort['Experiment Day'] || '—') : '—';
+  $('experimentDay').textContent = `Day ${day}/90`;
 
   // Last poll
-  if (state.last_poll_time) {
-    $('lastPoll').textContent = shortDate(state.last_poll_time);
-    $('pollAge').textContent = timeAgo(state.last_poll_time);
-    
-    // Check staleness (>5 min = warning)
-    const age = Date.now() - new Date(state.last_poll_time).getTime();
-    if (age > 300000) {
-      $('pollAge').style.color = 'var(--amber)';
-    } else {
-      $('pollAge').style.color = '';
-    }
+  if (latest && latest['Timestamp']) {
+    $('lastPoll').textContent = shortDate(latest['Timestamp']);
+    $('pollAge').textContent = timeAgo(latest['Timestamp']);
+    const age = Date.now() - new Date(latest['Timestamp']).getTime();
+    $('pollAge').style.color = age > 3600000 * 26 ? 'var(--amber)' : '';
   }
 
   // Source status
-  const sources = state.source_status || {};
-  const badgesHTML = Object.entries(sources).map(([name, status]) => {
-    let cls = 'source-badge--na';
-    if (status === 'OK' || status === 'ACTIVE') cls = 'source-badge--ok';
-    else if (status === 'ERROR' || status === 'FAIL') cls = 'source-badge--error';
-    return `<span class="source-badge ${cls}">${name}: ${status}</span>`;
-  }).join('');
-  
-  if (badgesHTML) {
-    $('sourceBadges').innerHTML = badgesHTML;
-  }
-
-  // Status dot
-  const errorsToday = state.errors_today || 0;
-  const dot = $('statusDot');
-  if (errorsToday > 5) {
-    dot.classList.add('status-dot--error');
-    dot.title = `${errorsToday} errors today`;
+  const statusStr = latest ? (latest['Source Status'] || '') : '';
+  const badges = [];
+  if (statusStr.includes('SEC_EDGAR')) {
+    const m = statusStr.match(/SEC_EDGAR['":\s]+(\w+)/);
+    badges.push({ name: 'SEC_EDGAR', status: m ? m[1] : 'OK' });
   } else {
-    dot.classList.remove('status-dot--error');
-    dot.title = 'System healthy';
+    badges.push({ name: 'SEC_EDGAR', status: 'OK' });
   }
+  badges.push({ name: 'SEDI', status: 'N/A' });
+  badges.push({ name: 'POLITICIAN', status: 'N/A' });
+
+  $('sourceBadges').innerHTML = badges.map(b => {
+    let cls = 'source-badge--na';
+    if (b.status === 'OK') cls = 'source-badge--ok';
+    return `<span class="source-badge ${cls}">${b.name}: ${b.status}</span>`;
+  }).join('');
 
   // Bottom bar
-  $('errorsToday').textContent = errorsToday;
-  $('totalFilings').textContent = state.total_filings_detected || 0;
-  $('totalSignals').textContent = state.total_signals_generated || 0;
+  $('errorsToday').textContent = latest ? (latest['Errors'] || 0) : 0;
+  $('totalFilings').textContent = latest ? (latest['Filings Detected'] || 0) : 0;
+  $('totalSignals').textContent = latest ? (latest['Signals Generated'] || 0) : 0;
 }
 
-function renderSummary(summary) {
-  if (!summary) return;
+function renderSummary(portfolioSnapshots, closedPositions, openPositions) {
+  const latest = portfolioSnapshots.length > 0 ? portfolioSnapshots[portfolioSnapshots.length - 1] : {};
+
+  const totalValue = parseFloat(latest['Total Value']) || 0;
+  const cash = parseFloat(latest['Cash']) || 0;
+  const posValue = parseFloat(latest['Positions Value']) || 0;
+  const totalPnl = parseFloat(latest['Total PnL $']) || 0;
+  const totalPnlPct = parseFloat(latest['Total PnL %']) || 0;
+  const winRate = parseFloat(latest['Win Rate %']) || 0;
+  const numOpen = parseInt(latest['Open Positions']) || openPositions.length;
+  const numClosed = parseInt(latest['Closed Positions']) || closedPositions.length;
 
   // KPI cards
-  $('kpiTotalValue').textContent = fmtMoney(summary.total_value);
-  
+  $('kpiTotalValue').textContent = fmtMoney(totalValue);
   const pnlEl = $('kpiPnl');
-  pnlEl.textContent = `${fmtMoney(summary.total_pnl)} (${fmtPct(summary.total_pnl_pct)})`;
-  pnlEl.className = 'kpi-card__delta ' + pnlClass(summary.total_pnl);
+  pnlEl.textContent = `${fmtMoney(totalPnl)} (${fmtPct(totalPnlPct)})`;
+  pnlEl.className = 'kpi-card__delta ' + pnlClass(totalPnl);
 
-  $('kpiOpenPositions').textContent = summary.open_positions || 0;
-  $('kpiPositionsValue').textContent = fmtMoney(summary.positions_value) + ' invested';
+  $('kpiOpenPositions').textContent = numOpen;
+  $('kpiPositionsValue').textContent = fmtMoney(posValue) + ' invested';
 
-  $('kpiSignalsToday').textContent = summary.signals_today || 0;
-  $('kpiTotalSignals').textContent = (summary.closed_trades + summary.open_positions || 0) + ' total trades';
+  $('kpiSignalsToday').textContent = numOpen + numClosed;
+  $('kpiTotalSignals').textContent = (numOpen + numClosed) + ' total trades';
 
-  if (summary.closed_trades > 0) {
-    $('kpiWinRate').textContent = fmt(summary.win_rate, 1) + '%';
-  } else {
-    $('kpiWinRate').textContent = '—';
-  }
-  $('kpiClosedTrades').textContent = (summary.closed_trades || 0) + ' closed trades';
+  $('kpiWinRate').textContent = numClosed > 0 ? fmt(winRate, 1) + '%' : '—';
+  $('kpiClosedTrades').textContent = numClosed + ' closed trades';
 
   // Performance summary
-  $('perfClosed').textContent = summary.closed_trades || 0;
-  $('perfWinRate').textContent = summary.closed_trades > 0 ? fmt(summary.win_rate, 1) + '%' : '—';
-  
+  $('perfClosed').textContent = numClosed;
+  $('perfWinRate').textContent = numClosed > 0 ? fmt(winRate, 1) + '%' : '—';
+
+  // Compute from closed positions
+  const wins = closedPositions.filter(p => parseFloat(p['Realized PnL $']) > 0);
+  const losses = closedPositions.filter(p => parseFloat(p['Realized PnL $']) <= 0);
+  const avgWin = wins.length > 0 ? wins.reduce((s, p) => s + parseFloat(p['Realized PnL $']), 0) / wins.length : 0;
+  const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((s, p) => s + parseFloat(p['Realized PnL $']), 0) / losses.length) : 0;
+
   const avgWinEl = $('perfAvgWin');
-  avgWinEl.textContent = fmtMoney(summary.avg_win);
-  avgWinEl.className = 'perf-stat__value mono ' + (summary.avg_win > 0 ? 'positive' : 'neutral');
+  avgWinEl.textContent = fmtMoney(avgWin);
+  avgWinEl.className = 'perf-stat__value mono ' + (avgWin > 0 ? 'positive' : 'neutral');
 
   const avgLossEl = $('perfAvgLoss');
-  avgLossEl.textContent = '-' + fmtMoney(summary.avg_loss);
-  avgLossEl.className = 'perf-stat__value mono ' + (summary.avg_loss > 0 ? 'negative' : 'neutral');
+  avgLossEl.textContent = fmtMoney(avgLoss);
+  avgLossEl.className = 'perf-stat__value mono ' + (avgLoss > 0 ? 'negative' : 'neutral');
 
-  $('perfProfitFactor').textContent = summary.profit_factor === Infinity ? '∞' : fmt(summary.profit_factor, 2);
+  const pf = avgLoss > 0 ? (avgWin / avgLoss) : 0;
+  $('perfProfitFactor').textContent = pf > 0 ? fmt(pf, 2) : '—';
 
   const totalPnlEl = $('perfTotalPnl');
-  totalPnlEl.textContent = fmtMoney(summary.total_pnl);
-  totalPnlEl.className = 'perf-stat__value mono ' + pnlClass(summary.total_pnl);
+  totalPnlEl.textContent = fmtMoney(totalPnl);
+  totalPnlEl.className = 'perf-stat__value mono ' + pnlClass(totalPnl);
 
   // Exit rules
-  renderExitRules(summary.exit_rules || {});
+  renderExitRules(closedPositions);
 
   // Open positions
-  renderPositions(summary.enriched_positions || []);
+  renderPositions(openPositions);
 
   // Unrealized PnL badge
-  const totalUnrealized = (summary.enriched_positions || []).reduce((s, p) => s + (p.unrealized_pnl || 0), 0);
+  const totalUnrealized = openPositions.reduce((s, p) => s + (parseFloat(p['Unrealized PnL $']) || 0), 0);
   const unrealizedEl = $('unrealizedPnl');
   unrealizedEl.textContent = fmtMoney(totalUnrealized);
   unrealizedEl.className = 'panel__badge mono ' + pnlClass(totalUnrealized);
 
   // Portfolio allocation
-  renderAllocation(summary.cash, summary.positions_value, summary.total_value);
+  renderAllocation(cash, posValue, totalValue);
 }
 
 function renderPositions(positions) {
   const tbody = $('positionsBody');
-  const open = positions.filter(p => p.status === 'open');
-
-  if (open.length === 0) {
+  if (!positions || positions.length === 0) {
     tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No open positions</td></tr>';
     return;
   }
 
-  tbody.innerHTML = open.map(p => {
-    const daysHeld = daysBetween(p.opened_at, new Date().toISOString());
+  tbody.innerHTML = positions.map(p => {
+    const entry = parseFloat(p['Entry Price']) || 0;
+    const current = parseFloat(p['Current Price']) || entry;
+    const pnl = parseFloat(p['Unrealized PnL $']) || 0;
+    const pnlPct = parseFloat(p['Unrealized PnL %']) || 0;
+    const stop = parseFloat(p['Stop Price']) || 0;
+    const target = parseFloat(p['Target Price']) || 0;
+    const daysHeld = p['Opened At'] ? daysBetween(p['Opened At'], new Date().toISOString()) : 0;
+
     return `<tr>
-      <td><strong>${p.ticker}</strong></td>
-      <td>${directionBadge(p.direction)}</td>
-      <td>${fmtMoney(p.entry_price)}</td>
-      <td>${fmtMoney(p.current_price)}</td>
-      <td class="${pnlClass(p.unrealized_pnl)}">${fmtMoney(p.unrealized_pnl)}</td>
-      <td class="${pnlClass(p.unrealized_pnl_pct)}">${fmtPct(p.unrealized_pnl_pct)}</td>
-      <td style="color:var(--coral)">${fmtMoney(p.stop_price)}</td>
-      <td style="color:var(--teal)">${fmtMoney(p.target_price)}</td>
+      <td><strong>${p['Ticker'] || '—'}</strong></td>
+      <td>${directionBadge(p['Direction'])}</td>
+      <td>${fmtMoney(entry)}</td>
+      <td>${fmtMoney(current)}</td>
+      <td class="${pnlClass(pnl)}">${fmtMoney(pnl)}</td>
+      <td class="${pnlClass(pnlPct)}">${fmtPct(pnlPct)}</td>
+      <td style="color:var(--coral)">${fmtMoney(stop)}</td>
+      <td style="color:var(--teal)">${fmtMoney(target)}</td>
       <td>${daysHeld}d</td>
     </tr>`;
   }).join('');
@@ -262,19 +290,19 @@ function renderSignals(signals) {
     return;
   }
 
-  // Show last 20
-  const recent = signals.slice(0, 20);
+  // Show most recent first (reverse)
+  const recent = signals.slice().reverse().slice(0, 20);
   tbody.innerHTML = recent.map(s => {
-    const time = shortTime(s.created_at || s.timestamp);
-    const conf = s.confidence != null ? fmt(s.confidence * 100, 0) + '%' : '—';
+    const time = shortDate(s['Generated At'] || '');
+    const score = parseFloat(s['Score']) || 0;
     return `<tr>
       <td>${time}</td>
-      <td><strong>${s.ticker || '—'}</strong></td>
-      <td>${directionBadge(s.direction)}</td>
-      <td>${scoreBar(s.score || 0)}</td>
-      <td>${conf}</td>
-      <td>${classificationBadge(s.classification)}</td>
-      <td>${s.status || '—'}</td>
+      <td><strong>${s['Ticker'] || '—'}</strong></td>
+      <td>${directionBadge(s['Direction'])}</td>
+      <td>${scoreBar(score)}</td>
+      <td>${s['Confidence'] || '—'}</td>
+      <td>${classificationBadge(s['Classification'])}</td>
+      <td>${s['Status'] || '—'}</td>
     </tr>`;
   }).join('');
 }
@@ -288,18 +316,18 @@ function renderFilings(filings) {
     return;
   }
 
-  feed.innerHTML = filings.slice(0, 50).map(f => {
-    const time = shortDate(f.filing_date || f.period_of_report || f.accepted_date);
-    const action = txnAction(f.transaction_code || f.type);
-    const shares = f.shares ? Number(f.shares).toLocaleString() : '—';
-    const price = f.price ? fmtMoney(f.price) : '';
-    const value = (f.shares && f.price) ? fmtMoney(f.shares * f.price, 0) : '—';
-    
+  // Show most recent first
+  const recent = filings.slice().reverse().slice(0, 50);
+  feed.innerHTML = recent.map(f => {
+    const time = shortDate(f['Detected At'] || f['Tx Date'] || '');
+    const action = txnAction(f['Tx Code'] || '');
+    const value = f['Dollar Value'] ? fmtMoney(parseFloat(f['Dollar Value']), 0) : '—';
+
     return `<div class="filing-item">
       <span class="filing-item__time">${time}</span>
       <span class="filing-item__info">
-        <span class="filing-item__ticker">${f.ticker || '—'}</span>
-        <span class="filing-item__name">${f.owner_name || f.insider_name || '—'}</span>
+        <span class="filing-item__ticker">${f['Ticker'] || '—'}</span>
+        <span class="filing-item__name">${f['Insider Name'] || '—'}</span>
         <span class="filing-item__action ${action.cls}">${action.label}</span>
       </span>
       <span class="filing-item__value">${value}</span>
@@ -307,16 +335,24 @@ function renderFilings(filings) {
   }).join('');
 }
 
-function renderExitRules(exitRules) {
+function renderExitRules(closedPositions) {
   const tbody = $('exitRulesBody');
-  const entries = Object.entries(exitRules);
 
-  if (entries.length === 0) {
+  if (!closedPositions || closedPositions.length === 0) {
     tbody.innerHTML = '<tr><td colspan="3" class="empty-state">No closed trades yet</td></tr>';
     return;
   }
 
-  tbody.innerHTML = entries.map(([rule, data]) => {
+  // Group by exit rule
+  const byRule = {};
+  closedPositions.forEach(p => {
+    const rule = p['Exit Rule'] || 'unknown';
+    if (!byRule[rule]) byRule[rule] = { count: 0, pnl: 0 };
+    byRule[rule].count++;
+    byRule[rule].pnl += parseFloat(p['Realized PnL $']) || 0;
+  });
+
+  tbody.innerHTML = Object.entries(byRule).map(([rule, data]) => {
     return `<tr>
       <td>${rule}</td>
       <td>${data.count}</td>
@@ -350,25 +386,26 @@ function renderAllocation(cash, positionsValue, total) {
 // ========== Data Refresh ==========
 
 async function refreshAll() {
-  const [state, summary, signals, filings] = await Promise.all([
-    fetchJSON('/api/state'),
-    fetchJSON('/api/summary'),
-    fetchJSON('/api/signals'),
-    fetchJSON('/api/filings')
+  const [filings, signals, openPositions, closedPositions, portfolioSnapshots, systemLogs] = await Promise.all([
+    fetchSheet(SHEET_NAMES.filings),
+    fetchSheet(SHEET_NAMES.signals),
+    fetchSheet(SHEET_NAMES.openPositions),
+    fetchSheet(SHEET_NAMES.closedPositions),
+    fetchSheet(SHEET_NAMES.portfolio),
+    fetchSheet(SHEET_NAMES.system),
   ]);
 
-  renderState(state);
-  renderSummary(summary);
-  renderSignals(signals || []);
-  renderFilings(filings || []);
+  renderState(systemLogs, portfolioSnapshots);
+  renderSummary(portfolioSnapshots, closedPositions, openPositions);
+  renderSignals(signals);
+  renderFilings(filings);
 
-  // Reset countdown
   countdown = REFRESH_INTERVAL;
 }
 
 function startCountdown() {
   if (refreshTimer) clearInterval(refreshTimer);
-  
+
   refreshTimer = setInterval(() => {
     countdown--;
     const el = $('refreshCountdown');
