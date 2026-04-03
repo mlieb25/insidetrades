@@ -4,7 +4,7 @@ Autonomous SEC Form 4 insider trade detection, scoring, and paper-trading system
 
 ## What It Does
 
-1. **Detects** new SEC Form 4 filings within minutes of public disclosure via EDGAR feeds
+1. **Detects** new SEC Form 4 filings within 1 day of public disclosure via EDGAR feeds
 2. **Parses** each filing to extract insider identity, role, transaction type, size, and price
 3. **Scores** every trade on a 100-point model (freshness, seniority, size, cluster, price gap, liquidity, market regime)
 4. **Generates signals** for high-conviction open-market insider purchases (score ≥ 65)
@@ -75,8 +75,7 @@ python -m trade_monitor.run_cycle health
 
 | Task | When | What |
 |------|------|------|
-| Hourly Poll | Mon–Fri 6AM–3PM | EDGAR polling + scoring + alerts |
-| Daily Digest | Mon–Fri 1:30PM | Portfolio summary email |
+| Daily Poll | Mon–Fri 6:15AM | Portfolio summary email |
 | Weekly Summary | Fridays 2:00PM | Performance report |
 
 ## Project Structure
