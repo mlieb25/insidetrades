@@ -1,12 +1,9 @@
-"""Gmail API email sender using GCP service account with domain-wide delegation.
+"""Gmail SMTP email sender using App Password.
 
-Uses the Google Cloud service account credentials to send emails
-via the Gmail API on behalf of insidertraderagent@gmail.com.
-
-Requires: google-auth, google-auth-httplib2, google-api-python-client
+Sends emails from insidertraderagent@gmail.com via Gmail SMTP
+with an app password. No GCP SDK dependencies required.
 """
-import base64
-import json
+import smtplib
 import os
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -15,55 +12,20 @@ from typing import Optional
 from . import config
 from .logger import log_system, log_error
 
-# Lazy imports — these libraries are only needed at runtime
-_service = None
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
 
 
-def _get_gmail_service():
-    """Build and cache the Gmail API service using service account credentials."""
-    global _service
-    if _service is not None:
-        return _service
-
-    try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
-
-        creds_path = os.path.join(config.BASE_DIR, "credentials",
-                                  "service_account.json")
-
-        # Fall back to environment variable path
-        if not os.path.exists(creds_path):
-            creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-
-        if not creds_path or not os.path.exists(creds_path):
-            log_error("Gmail service account credentials not found",
-                      {"searched": creds_path})
-            return None
-
-        SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
-
-        credentials = service_account.Credentials.from_service_account_file(
-            creds_path, scopes=SCOPES
-        )
-
-        # Delegate to the Gmail account
-        sender_email = os.environ.get("GMAIL_SENDER",
-                                      config.GMAIL_SENDER)
-        delegated = credentials.with_subject(sender_email)
-
-        _service = build("gmail", "v1", credentials=delegated)
-        log_system(f"Gmail API service initialized for {sender_email}")
-        return _service
-
-    except Exception as e:
-        log_error(f"Failed to initialize Gmail API: {e}")
-        return None
+def _get_credentials() -> tuple:
+    """Get SMTP credentials from config or environment."""
+    sender = os.environ.get("GMAIL_SENDER", config.GMAIL_SENDER)
+    password = os.environ.get("GMAIL_APP_PASSWORD", config.GMAIL_APP_PASSWORD)
+    return sender, password
 
 
 def send_email(to: str, subject: str, body_text: str,
                body_html: Optional[str] = None) -> bool:
-    """Send an email via Gmail API.
+    """Send an email via Gmail SMTP.
 
     Args:
         to: Recipient email address.
@@ -74,34 +36,39 @@ def send_email(to: str, subject: str, body_text: str,
     Returns:
         True if sent successfully, False otherwise.
     """
-    service = _get_gmail_service()
-    if service is None:
-        log_error("Gmail service not available — falling back to log-only")
+    sender, password = _get_credentials()
+
+    if not password:
+        log_error("GMAIL_APP_PASSWORD not configured — email not sent",
+                  {"subject": subject})
         return False
 
     try:
         if body_html:
-            message = MIMEMultipart("alternative")
-            message.attach(MIMEText(body_text, "plain"))
-            message.attach(MIMEText(body_html, "html"))
+            msg = MIMEMultipart("alternative")
+            msg.attach(MIMEText(body_text, "plain"))
+            msg.attach(MIMEText(body_html, "html"))
         else:
-            message = MIMEText(body_text, "plain")
+            msg = MIMEText(body_text, "plain")
 
-        sender = os.environ.get("GMAIL_SENDER", config.GMAIL_SENDER)
-        message["to"] = to
-        message["from"] = sender
-        message["subject"] = subject
+        msg["From"] = sender
+        msg["To"] = to
+        msg["Subject"] = subject
 
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-        body = {"raw": raw}
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(sender, password)
+            server.sendmail(sender, to, msg.as_string())
 
-        sent = (service.users().messages()
-                .send(userId="me", body=body).execute())
-
-        log_system(f"Email sent: {subject}", {"message_id": sent.get("id"),
-                                               "to": to})
+        log_system(f"Email sent: {subject}", {"to": to, "from": sender})
         return True
 
+    except smtplib.SMTPAuthenticationError as e:
+        log_error(f"SMTP auth failed — check app password: {e}",
+                  {"sender": sender})
+        return False
     except Exception as e:
         log_error(f"Failed to send email: {e}", {"to": to, "subject": subject})
         return False

@@ -1,10 +1,21 @@
 """Configuration constants for the trade monitoring system."""
 import os
 
+# Load .env file if present (no external dependency)
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 # ── Identity ──────────────────────────────────────────────────────────
 USER_AGENT = "Mitchell Liebrecht mitchellgliebrecht@gmail.com"
 EMAIL = "mitchellgliebrecht@gmail.com"
 GMAIL_SENDER = "insidertraderagent@gmail.com"
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 TIMEZONE = "America/Vancouver"
 
 # ── Mode ──────────────────────────────────────────────────────────────
