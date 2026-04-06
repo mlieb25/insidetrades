@@ -1,6 +1,9 @@
 // === INSIDER TRADE TRACKER — Frontend Logic ===
 
-const API_BASE = '__PORT_3000__'.startsWith('__') ? '' : '__PORT_3000__';
+// Detect if running locally (Express backend) or on GitHub Pages (Sheets-only)
+const IS_LOCAL = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+const API_BASE = IS_LOCAL ? '' : null; // null = use Sheets
+const SPREADSHEET_ID = '10_2yzOFxMic_lBAJLHwLEkg_1N8lqoQBEpNSUMRfef4';
 
 // --- State ---
 let portfolioData = null;
@@ -102,11 +105,13 @@ function showConfirm(title, message) {
 
 // --- API calls ---
 async function apiGet(path) {
+  if (!IS_LOCAL) throw new Error('No backend');
   const res = await fetch(API_BASE + path);
   return res.json();
 }
 
 async function apiPost(path, body) {
+  if (!IS_LOCAL) { showToast('Trade entry requires running locally', 'error'); return { error: 'Read-only' }; }
   const res = await fetch(API_BASE + path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -115,10 +120,130 @@ async function apiPost(path, body) {
   return res.json();
 }
 
+// --- Google Sheets reader (for GitHub Pages) ---
+async function fetchSheet(sheetName) {
+  const url = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(sheetName)}`;
+  try {
+    const res = await fetch(url);
+    const text = await res.text();
+    const match = text.match(/google\.visualization\.Query\.setResponse\(([\s\S]+)\);?/);
+    if (!match) return [];
+    const data = JSON.parse(match[1]);
+    const cols = data.table.cols.map(c => c.label || '');
+    return (data.table.rows || []).map(r => {
+      const obj = {};
+      r.c.forEach((cell, i) => {
+        if (cols[i]) obj[cols[i]] = cell ? (cell.v != null ? cell.v : (cell.f || '')) : '';
+      });
+      return obj;
+    });
+  } catch (e) {
+    console.error(`Failed to fetch sheet "${sheetName}":`, e);
+    return [];
+  }
+}
+
+async function loadPortfolioFromSheets() {
+  const [positions, closedTrades, history, settingsRows] = await Promise.all([
+    fetchSheet('Open Positions'),
+    fetchSheet('Closed Trades'),
+    fetchSheet('Portfolio History'),
+    fetchSheet('Settings'),
+  ]);
+
+  // Parse settings
+  const settings = {};
+  settingsRows.forEach(r => { if (r.Key) settings[r.Key] = r.Value; });
+  const startingCapital = parseFloat(settings.starting_capital) || 100000;
+
+  // Parse positions
+  const parsedPositions = positions.map(p => ({
+    tradeId: p['Trade ID'] || '',
+    ticker: p['Ticker'] || '',
+    company: p['Company'] || '',
+    direction: p['Direction'] || 'LONG',
+    entryDate: p['Entry Date'] || '',
+    entryPrice: parseFloat(p['Entry Price']) || 0,
+    shares: parseInt(p['Shares']) || 0,
+    costBasis: parseFloat(p['Cost Basis']) || 0,
+    currentPrice: parseFloat(p['Current Price']) || parseFloat(p['Entry Price']) || 0,
+    unrealizedPnl: parseFloat(p['Unrealized PnL']) || 0,
+    unrealizedPct: parseFloat(p['Unrealized %']) || 0,
+    stopLoss: parseFloat(p['Stop Loss']) || 0,
+    takeProfit: parseFloat(p['Take Profit']) || 0,
+    trailingStopPct: parseFloat(p['Trailing Stop %']) || 0,
+    expirationDate: p['Expiration Date'] || '',
+    thesis: p['Thesis'] || '',
+    source: p['Source'] || '',
+    insiderName: p['Insider Name'] || '',
+    insiderRole: p['Insider Role'] || '',
+    filingUrl: p['Filing URL'] || '',
+  }));
+
+  // Parse closed trades
+  const parsedClosed = closedTrades.map(t => ({
+    tradeId: t['Trade ID'] || '',
+    ticker: t['Ticker'] || '',
+    company: t['Company'] || '',
+    direction: t['Direction'] || 'LONG',
+    entryDate: t['Entry Date'] || '',
+    entryPrice: parseFloat(t['Entry Price']) || 0,
+    exitDate: t['Exit Date'] || '',
+    exitPrice: parseFloat(t['Exit Price']) || 0,
+    shares: parseInt(t['Shares']) || 0,
+    realizedPnl: parseFloat(t['Realized PnL']) || 0,
+    realizedPct: parseFloat(t['Realized %']) || 0,
+    exitReason: t['Exit Reason'] || '',
+    daysHeld: parseInt(t['Days Held']) || 0,
+  }));
+
+  // Parse history
+  const parsedHistory = history.map(h => ({
+    date: h['Date'] || '',
+    cash: parseFloat(h['Cash']) || 0,
+    positionsValue: parseFloat(h['Positions Value']) || 0,
+    totalValue: parseFloat(h['Total Value']) || 0,
+    totalPnl: parseFloat(h['Total PnL']) || 0,
+    totalPnlPct: parseFloat(h['Total PnL %']) || 0,
+  }));
+
+  // Calculate portfolio values
+  const positionsValue = parsedPositions.reduce((s, p) => s + (p.currentPrice * p.shares), 0);
+  const latestHist = parsedHistory.length > 0 ? parsedHistory[parsedHistory.length - 1] : null;
+  const cash = latestHist ? latestHist.cash : startingCapital;
+  const totalValue = cash + positionsValue;
+  const totalPnl = totalValue - startingCapital;
+  const totalPnlPct = (totalPnl / startingCapital) * 100;
+
+  // Performance
+  const wins = parsedClosed.filter(t => t.realizedPnl > 0);
+  const losses = parsedClosed.filter(t => t.realizedPnl <= 0);
+  const winRate = parsedClosed.length > 0 ? (wins.length / parsedClosed.length) * 100 : 0;
+  const avgWin = wins.length > 0 ? wins.reduce((s, t) => s + t.realizedPnl, 0) / wins.length : 0;
+  const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((s, t) => s + t.realizedPnl, 0) / losses.length) : 0;
+  const profitFactor = avgLoss > 0 ? avgWin / avgLoss : avgWin > 0 ? Infinity : 0;
+  const avgDaysHeld = parsedClosed.length > 0 ? parsedClosed.reduce((s, t) => s + t.daysHeld, 0) / parsedClosed.length : 0;
+  const bestTrade = parsedClosed.length > 0 ? parsedClosed.reduce((b, t) => t.realizedPnl > b.realizedPnl ? t : b, parsedClosed[0]) : null;
+  const worstTrade = parsedClosed.length > 0 ? parsedClosed.reduce((w, t) => t.realizedPnl < w.realizedPnl ? t : w, parsedClosed[0]) : null;
+
+  return {
+    cash, positionsValue, totalValue, totalPnl, totalPnlPct, startingCapital,
+    positions: parsedPositions,
+    closedTrades: parsedClosed,
+    settings,
+    history: parsedHistory,
+    performance: { totalTrades: parsedClosed.length, wins: wins.length, losses: losses.length, winRate, avgWin, avgLoss, profitFactor, avgDaysHeld, bestTrade, worstTrade },
+  };
+}
+
 // --- Load Portfolio ---
 async function loadPortfolio() {
   try {
-    portfolioData = await apiGet('/api/portfolio');
+    if (IS_LOCAL) {
+      portfolioData = await apiGet('/api/portfolio');
+    } else {
+      portfolioData = await loadPortfolioFromSheets();
+    }
     renderDashboard();
   } catch (err) {
     console.error('Failed to load portfolio:', err);
@@ -215,10 +340,10 @@ function renderOpenPositions(positions) {
         <td${expWarning}>${shortDate(p.expirationDate)}</td>
         <td>${days}d</td>
         <td>
-          <div class="action-btns">
+          ${IS_LOCAL ? `<div class="action-btns">
             <button class="btn-sm btn-close" onclick="showCloseForm('${p.tradeId}')">Close</button>
             <button class="btn-sm btn-edit" onclick="showEditForm('${p.tradeId}', ${p.stopLoss}, ${p.takeProfit}, ${p.trailingStopPct || 0}, '${p.expirationDate}')">Edit</button>
-          </div>
+          </div>` : ''}
         </td>
       </tr>
       <tr id="close-form-${p.tradeId}" style="display:none;">
@@ -632,6 +757,12 @@ async function handleNewTrade(event) {
 
 // --- Init ---
 document.addEventListener('DOMContentLoaded', () => {
+  // Hide trade entry form and action buttons on GitHub Pages (read-only)
+  if (!IS_LOCAL) {
+    const tradeForm = document.querySelector('.panel-collapsible');
+    if (tradeForm) tradeForm.style.display = 'none';
+  }
+
   loadPortfolio();
   // Auto-refresh every 60 seconds
   refreshInterval = setInterval(loadPortfolio, 60000);
