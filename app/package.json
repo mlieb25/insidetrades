@@ -1,0 +1,14 @@
+{
+  "name": "insider-trade-tracker",
+  "version": "1.0.0",
+  "description": "Paper trading app for insider trade replication experiment",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "googleapis": "^130.0.0"
+  }
+}
