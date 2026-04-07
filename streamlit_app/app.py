@@ -3,6 +3,10 @@ app.py — Insider Trade Tracker (Streamlit)
 Run with: streamlit run app.py
 """
 
+import sys, os
+# Ensure the app's own directory is on the path (required on Streamlit Cloud)
+sys.path.insert(0, os.path.dirname(__file__))
+
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
@@ -10,6 +14,7 @@ from datetime import date, timedelta
 import uuid
 
 import sheets as sh
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Page config & global CSS
