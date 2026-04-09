@@ -36,3 +36,7 @@ Thumbs.db
 # Node (dashboard)
 node_modules/
 package-lock.json
+.env
+*.json
+.streamlit/secrets.toml
+streamlit_app/.streamlit/secrets.toml

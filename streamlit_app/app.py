@@ -14,6 +14,7 @@ from datetime import date, timedelta
 import uuid
 
 import sheets as sh
+import prices
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -282,22 +283,9 @@ def load_data():
     closed_rows = sh.get_sheet_data("Closed Trades")
     history_rows = sh.get_sheet_data("Portfolio History")
 
-    # Fetch live prices using yfinance
-    open_tickers = list(set([r[1].strip().upper() for r in open_rows if len(r) > 1 and r[1]]))
-    latest_prices = {}
-    if open_tickers:
-        import yfinance as yf
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            for ticker in open_tickers:
-                try:
-                    t = yf.Ticker(ticker)
-                    val = t.fast_info.last_price
-                    if val is not None:
-                        latest_prices[ticker] = float(val)
-                except Exception:
-                    pass
+    # Fetch live prices for all open position tickers
+    open_tickers = list({r[1].strip().upper() for r in open_rows if len(r) > 1 and r[1].strip()})
+    latest_prices = prices.get_bulk_prices(open_tickers) if open_tickers else {}
 
     positions = []
     for r in open_rows:
@@ -310,7 +298,7 @@ def load_data():
         shares = safe_int(r[6])
         cost_basis = safe_float(r[7])
         
-        # Use latest price from Universe tab if available, else sheet value
+        # Use live price if available, else fall back to sheet value
         current_price = latest_prices.get(ticker, safe_float(r[8]))
         
         # Calculate unrealized PnL dynamically
@@ -516,34 +504,50 @@ left, right = st.columns([3, 2], gap="large")
 # ─────────────────────────────────────────────────────────────────────────────
 
 with left:
-    with st.expander("🔍 Live Ticker Search", expanded=True):
-        sc1, sc2, sc3 = st.columns([1.5, 1, 1.5])
-        search_ticker = sc1.text_input("Lookup Ticker", placeholder="AAPL", key="live_search").strip().upper()
-        
-        search_price = 0.0
-        if search_ticker:
-            try:
-                import yfinance as yf
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter('ignore')
-                    t = yf.Ticker(search_ticker)
-                    last_price = t.fast_info.last_price
-                    if last_price:
-                        search_price = float(last_price)
-                        sc2.metric(f"{search_ticker}", fmt_usd(search_price))
-                    else:
-                        sc2.error("No data")
-            except Exception:
-                sc2.error("Not found")
+    # ── Live Ticker Search ────────────────────────────────────────────────
+    with st.expander("🔍 Ticker Lookup", expanded=False):
+        search_q = st.text_input("Search ticker or company name", placeholder="e.g. AAPL or Apple", key="ticker_search")
+        if search_q and len(search_q) >= 1:
+            quote = prices.get_quote(search_q.strip().upper())
+            if quote:
+                chg_color = "#00d4aa" if quote["change"] >= 0 else "#ff6b6b"
+                chg_sign = "+" if quote["change"] >= 0 else ""
+                mcap = f"${quote['market_cap']/1e9:.1f}B" if quote.get("market_cap") else "--"
+                st.markdown(f"""
+                <div style="background:#13151f;border:1px solid #2a2d3a;border-radius:10px;padding:14px 18px;margin-top:6px">
+                    <span style="font-family:'JetBrains Mono',monospace;font-size:1.1rem;font-weight:700;color:#e2e8f0">{quote['ticker']}</span>
+                    <span style="color:#6b7185;font-size:0.82rem;margin-left:10px">{quote['name']}</span>
+                    <br>
+                    <span style="font-family:'JetBrains Mono',monospace;font-size:1.3rem;font-weight:700;color:#e2e8f0">${quote['price']:.2f}</span>
+                    <span style="font-family:'JetBrains Mono',monospace;font-size:0.9rem;font-weight:600;color:{chg_color};margin-left:12px">
+                        {chg_sign}{quote['change']:.2f} ({chg_sign}{quote['change_pct']:.2f}%)
+                    </span>
+                    <br>
+                    <span style="font-size:0.75rem;color:#6b7185">Prev Close ${quote['prev_close']:.2f} · Mkt Cap {mcap} · {quote.get('sector','')}</span>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                # Try search if direct quote failed
+                results = prices.search_ticker(search_q)
+                if results:
+                    for r in results:
+                        st.markdown(f"""
+                        <div style="background:#13151f;border:1px solid #1e2130;border-radius:8px;padding:8px 14px;margin-bottom:4px">
+                            <span style="font-family:'JetBrains Mono',monospace;font-weight:600;color:#e2e8f0">{r['symbol']}</span>
+                            <span style="color:#6b7185;font-size:0.8rem;margin-left:8px">{r['name']}</span>
+                            <span style="color:#3d4460;font-size:0.72rem;margin-left:8px">{r['exchange']} · {r['type']}</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+                else:
+                    st.warning(f"No results for '{search_q}'")
 
     with st.expander("⚡ Enter New Trade", expanded=True):
-        with st.form("new_trade_form", clear_on_submit=False):
+        with st.form("new_trade_form", clear_on_submit=True):
             st.markdown('<div class="section-header">Position Details</div>', unsafe_allow_html=True)
             c1, c2, c3, c4 = st.columns(4)
-            ticker = c1.text_input("Ticker *", value=search_ticker, placeholder="AAPL").strip().upper()
+            ticker = c1.text_input("Ticker *", placeholder="AAPL").strip().upper()
             direction = c2.selectbox("Direction", ["LONG", "SHORT"])
-            entry_price = c3.number_input("Entry Price *", value=search_price if search_price > 0 else 0.0, min_value=0.00, step=0.01, format="%.2f")
+            entry_price = c3.number_input("Entry Price *", min_value=0.01, step=0.01, format="%.2f")
             shares = c4.number_input("Shares *", min_value=1, step=1)
 
             st.markdown('<div class="section-header" style="margin-top:0.5rem">Risk Management</div>', unsafe_allow_html=True)
