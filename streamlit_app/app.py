@@ -504,69 +504,92 @@ left, right = st.columns([3, 2], gap="large")
 # ─────────────────────────────────────────────────────────────────────────────
 
 with left:
-    # ── Live Ticker Search ────────────────────────────────────────────────
-    with st.expander("🔍 Ticker Lookup", expanded=False):
-        search_q = st.text_input("Search ticker or company name", placeholder="e.g. AAPL or Apple", key="ticker_search")
-        if search_q and len(search_q) >= 1:
-            quote = prices.get_quote(search_q.strip().upper())
-            if quote:
-                chg_color = "#00d4aa" if quote["change"] >= 0 else "#ff6b6b"
-                chg_sign = "+" if quote["change"] >= 0 else ""
-                mcap = f"${quote['market_cap']/1e9:.1f}B" if quote.get("market_cap") else "--"
+    with st.expander("⚡ Enter New Trade", expanded=True):
+        st.markdown('<div class="section-header">Ticker</div>', unsafe_allow_html=True)
+
+        # ── Ticker input (outside the form so it triggers a live lookup) ───
+        nt_ticker_raw = st.text_input(
+            "Ticker *",
+            placeholder="AAPL",
+            key="nt_ticker",
+            label_visibility="collapsed",
+        ).strip().upper()
+
+        # Live price card — shown as soon as we have a valid ticker
+        _live_quote = None
+        _live_price  = None
+        if nt_ticker_raw:
+            with st.spinner(f"Fetching {nt_ticker_raw}…"):
+                _live_quote = prices.get_quote(nt_ticker_raw)
+
+            if _live_quote:
+                _live_price = _live_quote["price"]
+                _chg_color  = "#00d4aa" if _live_quote["change"] >= 0 else "#ff6b6b"
+                _chg_sign   = "+" if _live_quote["change"] >= 0 else ""
+                _mcap       = (
+                    f"${_live_quote['market_cap']/1e9:.1f}B"
+                    if _live_quote.get("market_cap") else "--"
+                )
                 st.markdown(f"""
-                <div style="background:#13151f;border:1px solid #2a2d3a;border-radius:10px;padding:14px 18px;margin-top:6px">
-                    <span style="font-family:'JetBrains Mono',monospace;font-size:1.1rem;font-weight:700;color:#e2e8f0">{quote['ticker']}</span>
-                    <span style="color:#6b7185;font-size:0.82rem;margin-left:10px">{quote['name']}</span>
-                    <br>
-                    <span style="font-family:'JetBrains Mono',monospace;font-size:1.3rem;font-weight:700;color:#e2e8f0">${quote['price']:.2f}</span>
-                    <span style="font-family:'JetBrains Mono',monospace;font-size:0.9rem;font-weight:600;color:{chg_color};margin-left:12px">
-                        {chg_sign}{quote['change']:.2f} ({chg_sign}{quote['change_pct']:.2f}%)
+                <div style="background:#13151f;border:1px solid #2a2d3a;border-radius:10px;
+                            padding:12px 18px;margin:6px 0 10px 0">
+                    <span style="font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:700;color:#e2e8f0">
+                        {_live_quote['ticker']}
+                    </span>
+                    <span style="color:#6b7185;font-size:0.82rem;margin-left:10px">{_live_quote['name']}</span>
+                    &nbsp;&nbsp;
+                    <span style="font-family:'JetBrains Mono',monospace;font-size:1.25rem;font-weight:700;color:#e2e8f0">
+                        ${_live_quote['price']:.2f}
+                    </span>
+                    <span style="font-family:'JetBrains Mono',monospace;font-size:0.88rem;font-weight:600;
+                                color:{_chg_color};margin-left:10px">
+                        {_chg_sign}{_live_quote['change']:.2f} ({_chg_sign}{_live_quote['change_pct']:.2f}%)
                     </span>
                     <br>
-                    <span style="font-size:0.75rem;color:#6b7185">Prev Close ${quote['prev_close']:.2f} · Mkt Cap {mcap} · {quote.get('sector','')}</span>
+                    <span style="font-size:0.73rem;color:#6b7185">
+                        Prev Close ${_live_quote['prev_close']:.2f} &nbsp;·&nbsp;
+                        Mkt Cap {_mcap} &nbsp;·&nbsp;
+                        {_live_quote.get('sector','')}
+                    </span>
                 </div>
                 """, unsafe_allow_html=True)
             else:
-                # Try search if direct quote failed
-                results = prices.search_ticker(search_q)
-                if results:
-                    for r in results:
-                        st.markdown(f"""
-                        <div style="background:#13151f;border:1px solid #1e2130;border-radius:8px;padding:8px 14px;margin-bottom:4px">
-                            <span style="font-family:'JetBrains Mono',monospace;font-weight:600;color:#e2e8f0">{r['symbol']}</span>
-                            <span style="color:#6b7185;font-size:0.8rem;margin-left:8px">{r['name']}</span>
-                            <span style="color:#3d4460;font-size:0.72rem;margin-left:8px">{r['exchange']} · {r['type']}</span>
-                        </div>
-                        """, unsafe_allow_html=True)
-                else:
-                    st.warning(f"No results for '{search_q}'")
+                st.warning(f"Could not find a quote for **{nt_ticker_raw}**. Check the ticker and try again.")
 
-    with st.expander("⚡ Enter New Trade", expanded=True):
+        # ── Rest of the form ─────────────────────────────────────────────────
         with st.form("new_trade_form", clear_on_submit=True):
+            # Stash the ticker value so the form can read it
+            ticker = nt_ticker_raw
+
             st.markdown('<div class="section-header">Position Details</div>', unsafe_allow_html=True)
-            c1, c2, c3, c4 = st.columns(4)
-            ticker = c1.text_input("Ticker *", placeholder="AAPL").strip().upper()
-            direction = c2.selectbox("Direction", ["LONG", "SHORT"])
-            entry_price = c3.number_input("Entry Price *", min_value=0.01, step=0.01, format="%.2f")
-            shares = c4.number_input("Shares *", min_value=1, step=1)
+            c1, c2, c3 = st.columns(3)
+            direction   = c1.selectbox("Direction", ["LONG", "SHORT"])
+            _default_ep = float(_live_price) if _live_price else 0.01
+            entry_price = c2.number_input(
+                "Entry Price *",
+                min_value=0.01, step=0.01, format="%.2f",
+                value=_default_ep,
+            )
+            shares = c3.number_input("Shares *", min_value=1, step=1)
 
             st.markdown('<div class="section-header" style="margin-top:0.5rem">Risk Management</div>', unsafe_allow_html=True)
             r1, r2, r3, r4 = st.columns(4)
-            stop_loss = r1.number_input("Stop Loss", min_value=0.0, step=0.01, format="%.2f", value=0.0)
-            take_profit = r2.number_input("Take Profit", min_value=0.0, step=0.01, format="%.2f", value=0.0)
-            trailing_stop = r3.number_input("Trailing Stop %", min_value=0.0, step=0.1, format="%.1f", value=0.0)
-            default_exp = date.today() + timedelta(days=d["default_exp_days"])
-            exp_date = r4.date_input("Expiration Date", value=default_exp)
+            stop_loss    = r1.number_input("Stop Loss",       min_value=0.0, step=0.01, format="%.2f", value=0.0)
+            take_profit  = r2.number_input("Take Profit",     min_value=0.0, step=0.01, format="%.2f", value=0.0)
+            trailing_stop = r3.number_input("Trailing Stop %", min_value=0.0, step=0.1,  format="%.1f", value=0.0)
+            default_exp  = date.today() + timedelta(days=d["default_exp_days"])
+            exp_date     = r4.date_input("Expiration Date", value=default_exp)
 
             st.markdown('<div class="section-header" style="margin-top:0.5rem">Trade Context</div>', unsafe_allow_html=True)
+            _default_company = _live_quote["name"] if _live_quote else ""
             t1, t2 = st.columns(2)
-            company = t1.text_input("Company Name", placeholder="Apple Inc.")
-            source = t2.selectbox("Source", ["SEC Form 4", "SEDI", "Politician Disclosure", "News", "Other", ""])
-            i1, i2 = st.columns(2)
+            company      = t1.text_input("Company Name", value=_default_company, placeholder="Apple Inc.")
+            source       = t2.selectbox("Source", ["SEC Form 4", "SEDI", "Politician Disclosure", "News", "Other", ""])
+            i1, i2       = st.columns(2)
             insider_name = i1.text_input("Insider Name", placeholder="John Doe")
             insider_role = i2.text_input("Insider Role", placeholder="CEO")
-            filing_url = st.text_input("Filing URL", placeholder="https://www.sec.gov/...")
-            thesis = st.text_area("Thesis", placeholder="Why are you taking this trade?", height=80)
+            filing_url   = st.text_input("Filing URL", placeholder="https://www.sec.gov/...")
+            thesis       = st.text_area("Thesis", placeholder="Why are you taking this trade?", height=80)
 
             submitted = st.form_submit_button("⚡ ENTER TRADE", use_container_width=True, type="primary")
 
@@ -580,12 +603,12 @@ with left:
             if shares <= 0:
                 errors.append("Shares must be > 0.")
 
-            cost_basis = entry_price * shares
-            positions_val = sum(p["cost_basis"] for p in d["positions"])
+            cost_basis       = entry_price * shares
+            positions_val    = sum(p["cost_basis"] for p in d["positions"])
             realized_pnl_calc = sum(t["realized_pnl"] for t in d["closed_trades"])
-            avail_cash = d["starting_capital"] - positions_val + realized_pnl_calc
-            total_val = avail_cash + positions_val
-            max_pos = total_val * (d["max_position_pct"] / 100)
+            avail_cash       = d["starting_capital"] - positions_val + realized_pnl_calc
+            total_val        = avail_cash + positions_val
+            max_pos          = total_val * (d["max_position_pct"] / 100)
 
             if cost_basis > avail_cash:
                 errors.append(f"Insufficient cash. Need {fmt_usd(cost_basis)}, have {fmt_usd(avail_cash)}.")
@@ -596,7 +619,6 @@ with left:
                 for e in errors:
                     st.error(e)
             else:
-                # ── Defaults ────────────────────────────────────────────────
                 sl = stop_loss if stop_loss > 0 else (
                     entry_price * (1 - d["default_stop_pct"] / 100) if direction == "LONG"
                     else entry_price * (1 + d["default_stop_pct"] / 100)
