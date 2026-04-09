@@ -287,29 +287,34 @@ def load_data():
     open_tickers = list({r[1].strip().upper() for r in open_rows if len(r) > 1 and r[1].strip()})
     latest_prices = prices.get_bulk_prices(open_tickers) if open_tickers else {}
 
-    positions = []
+    positions = []      # active trades — count toward portfolio value
+    pending_positions = []  # pending trades — visible but excluded from portfolio math
+
     for r in open_rows:
-        while len(r) < 20:
+        while len(r) < 21:
             r.append("")
-            
+
+        # Column 20 (index 20) = status; default to "active" if blank
+        status = r[20].strip().lower() if r[20].strip() else "active"
+
         ticker = r[1].strip().upper()
         direction = r[3]
         entry_price = safe_float(r[5])
         shares = safe_int(r[6])
         cost_basis = safe_float(r[7])
-        
+
         # Use live price if available, else fall back to sheet value
         current_price = latest_prices.get(ticker, safe_float(r[8]))
-        
+
         # Calculate unrealized PnL dynamically
         if direction == "LONG":
             unrealized_pnl = (current_price - entry_price) * shares
-        else: # SHORT
+        else:  # SHORT
             unrealized_pnl = (entry_price - current_price) * shares
-            
+
         unrealized_pct = (unrealized_pnl / cost_basis * 100) if cost_basis > 0 else 0.0
 
-        positions.append({
+        record = {
             "trade_id": r[0], "ticker": r[1], "company": r[2],
             "direction": direction, "entry_date": r[4],
             "entry_price": entry_price,
@@ -324,7 +329,13 @@ def load_data():
             "expiration_date": r[14],
             "thesis": r[15], "source": r[16],
             "insider_name": r[17], "insider_role": r[18], "filing_url": r[19],
-        })
+            "status": status,
+        }
+
+        if status == "pending":
+            pending_positions.append(record)
+        else:
+            positions.append(record)
 
     closed_trades = []
     for r in closed_rows:
@@ -361,7 +372,7 @@ def load_data():
             "win_rate": safe_float(r[8]),
         })
 
-    # ── Compute portfolio state ──────────────────────────────────────────────
+    # ── Compute portfolio state (active positions only) ──────────────────────
     total_unrealized_pnl = sum(p["unrealized_pnl"] for p in positions)
     positions_value = sum(p["cost_basis"] for p in positions)
     realized_pnl = sum(t["realized_pnl"] for t in closed_trades)
@@ -392,6 +403,7 @@ def load_data():
         "exp_start": exp_start,
         "exp_end": exp_end,
         "positions": positions,
+        "pending_positions": pending_positions,
         "closed_trades": closed_trades,
         "history": history,
         "cash": cash,
@@ -474,11 +486,13 @@ with k2:
     </div>""", unsafe_allow_html=True)
 
 with k3:
+    pending_count = len(d["pending_positions"])
+    pending_note = f" · {pending_count} pending" if pending_count else ""
     st.markdown(f"""
     <div class="kpi-card">
         <span class="kpi-label">Open Positions</span>
         <span class="kpi-value">{len(d["positions"])}</span>
-        <span class="kpi-sub neu">{fmt_usd(d["positions_value"])} invested</span>
+        <span class="kpi-sub neu">{fmt_usd(d["positions_value"])} invested{pending_note}</span>
     </div>""", unsafe_allow_html=True)
 
 with k4:
@@ -637,6 +651,7 @@ with left:
                     round(trailing_stop, 1) if trailing_stop > 0 else "",
                     exp_date.isoformat(),
                     thesis, source, insider_name, insider_role, filing_url,
+                    "active",  # column 21 — status
                 ]
                 try:
                     sh.append_row("Open Positions", row)
@@ -650,7 +665,7 @@ with left:
                 except Exception as ex:
                     st.error(f"Failed to write to Google Sheets: {ex}")
 
-    # ── Open Positions Table ─────────────────────────────────────────────────
+    # ── Active Open Positions Table ──────────────────────────────────────────
     st.markdown(f'<div class="section-header">Open Positions <span style="color:#00d4aa">({len(d["positions"])})</span></div>', unsafe_allow_html=True)
 
     if not d["positions"]:
@@ -754,7 +769,7 @@ with left:
                         st.rerun()
 
                     if save_edit:
-                        # Build updated row (20 columns)
+                        # Build updated row (21 columns), preserving existing status
                         updated = [
                             p["trade_id"], p["ticker"], p["company"], p["direction"],
                             p["entry_date"], p["entry_price"], p["shares"], p["cost_basis"],
@@ -763,6 +778,7 @@ with left:
                             round(new_trail, 1) if new_trail > 0 else "",
                             new_exp.isoformat(),
                             p["thesis"], p["source"], p["insider_name"], p["insider_role"], p["filing_url"],
+                            p["status"],  # preserve existing status
                         ]
                         try:
                             sh.update_row("Open Positions", idx + 2, updated)
@@ -774,6 +790,83 @@ with left:
                             st.rerun()
                         except Exception as ex:
                             st.error(f"Failed to edit trade: {ex}")
+
+    # ── Pending Positions Section ────────────────────────────────────────────
+    if d["pending_positions"]:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="section-header">Pending Positions '
+            f'<span style="color:#ffa726">({len(d["pending_positions"])})</span>'
+            f'<span style="color:#6b7185;font-size:0.65rem;margin-left:8px">· excluded from portfolio value</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Pending trades need their true row index in the full open_rows list.
+        # Since load_data splits positions/pending in order, we reconstruct the
+        # original row offsets: active positions come first, pending after —
+        # but they could be interleaved in the sheet. We identify each pending
+        # trade by its trade_id matched back to its sheet row index.
+        all_open_rows_ordered = d["positions"] + d["pending_positions"]
+
+        for p in d["pending_positions"]:
+            # Find this trade's 0-based index among all open rows (active + pending combined)
+            all_open = d["positions"] + d["pending_positions"]
+            pending_sheet_idx = next(
+                (i for i, row in enumerate(all_open) if row["trade_id"] == p["trade_id"]),
+                None,
+            )
+
+            days_held = (date.today() - date.fromisoformat(p["entry_date"])).days if p["entry_date"] else 0
+            exp_days_left = (date.fromisoformat(p["expiration_date"]) - date.today()).days if p["expiration_date"] else None
+            pnl_color_pos = "#00d4aa" if p["unrealized_pnl"] >= 0 else "#ff6b6b"
+            dir_icon = "▲" if p["direction"] == "LONG" else "▼"
+            exp_warn = "⚠️ " if exp_days_left is not None and exp_days_left <= 5 else ""
+            exp_text = f"{exp_warn}{p['expiration_date']} ({exp_days_left}d left)" if exp_days_left is not None else p["expiration_date"]
+
+            with st.container():
+                header_col, action_col = st.columns([5, 1])
+                with header_col:
+                    st.markdown(f"""
+                    <div style="background:#13151f;border:1px solid rgba(255,167,38,0.25);border-radius:10px;padding:12px 16px;margin-bottom:4px;opacity:0.85">
+                        <span style="background:rgba(255,167,38,0.15);color:#ffa726;border:1px solid rgba(255,167,38,0.3);border-radius:4px;padding:1px 7px;font-size:0.65rem;font-weight:700;letter-spacing:0.06em;margin-right:8px">PENDING</span>
+                        <span style="font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:700;color:#e2e8f0">{dir_icon} {p['ticker']}</span>
+                        <span style="color:#6b7185;font-size:0.8rem;margin-left:10px">{p['company']}</span>
+                        &nbsp;&nbsp;
+                        <span style="font-family:'JetBrains Mono',monospace;font-size:0.82rem;color:#9aa0b0">Entry {fmt_usd(p['entry_price'])} · Current {fmt_usd(p['current_price'])} · {int(p['shares'])} shares · Cost {fmt_usd(p['cost_basis'])}</span>
+                        &nbsp;&nbsp;
+                        <span style="font-family:'JetBrains Mono',monospace;font-size:0.9rem;font-weight:600;color:{pnl_color_pos}">
+                            {'+' if p['unrealized_pnl'] >= 0 else ''}{fmt_usd(p['unrealized_pnl'])} ({fmt_pct(p['unrealized_pct'])})
+                        </span>
+                        <br>
+                        <span style="font-size:0.75rem;color:#6b7185">SL {fmt_usd(p['stop_loss'])} · TP {fmt_usd(p['take_profit'])} · Exp {exp_text} · {days_held}d held</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                with action_col:
+                    if st.button("Activate", key=f"activate_btn_{p['trade_id']}", use_container_width=True):
+                        if pending_sheet_idx is not None:
+                            updated = [
+                                p["trade_id"], p["ticker"], p["company"], p["direction"],
+                                p["entry_date"], p["entry_price"], p["shares"], p["cost_basis"],
+                                p["current_price"], p["unrealized_pnl"], p["unrealized_pct"],
+                                p["stop_loss"], p["take_profit"],
+                                p["trailing_stop_pct"] if p["trailing_stop_pct"] else "",
+                                p["expiration_date"],
+                                p["thesis"], p["source"], p["insider_name"], p["insider_role"], p["filing_url"],
+                                "active",  # promote to active
+                            ]
+                            try:
+                                sh.update_row("Open Positions", pending_sheet_idx + 2, updated)
+                                sh.append_row("Trade Log", [
+                                    timestamp_str(), p["trade_id"], "ACTIVATE", p["ticker"],
+                                    "Status changed from pending → active"
+                                ])
+                                st.success(f"✅ {p['ticker']} activated — now counting toward portfolio value.")
+                                st.cache_data.clear()
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(f"Failed to activate trade: {ex}")
 
     # ── Closed Trades Table ──────────────────────────────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
