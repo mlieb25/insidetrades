@@ -282,19 +282,54 @@ def load_data():
     closed_rows = sh.get_sheet_data("Closed Trades")
     history_rows = sh.get_sheet_data("Portfolio History")
 
+    # Fetch live prices using yfinance
+    open_tickers = list(set([r[1].strip().upper() for r in open_rows if len(r) > 1 and r[1]]))
+    latest_prices = {}
+    if open_tickers:
+        import yfinance as yf
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            for ticker in open_tickers:
+                try:
+                    t = yf.Ticker(ticker)
+                    val = t.fast_info.last_price
+                    if val is not None:
+                        latest_prices[ticker] = float(val)
+                except Exception:
+                    pass
+
     positions = []
     for r in open_rows:
         while len(r) < 20:
             r.append("")
+            
+        ticker = r[1].strip().upper()
+        direction = r[3]
+        entry_price = safe_float(r[5])
+        shares = safe_int(r[6])
+        cost_basis = safe_float(r[7])
+        
+        # Use latest price from Universe tab if available, else sheet value
+        current_price = latest_prices.get(ticker, safe_float(r[8]))
+        
+        # Calculate unrealized PnL dynamically
+        if direction == "LONG":
+            unrealized_pnl = (current_price - entry_price) * shares
+        else: # SHORT
+            unrealized_pnl = (entry_price - current_price) * shares
+            
+        unrealized_pct = (unrealized_pnl / cost_basis * 100) if cost_basis > 0 else 0.0
+
         positions.append({
             "trade_id": r[0], "ticker": r[1], "company": r[2],
-            "direction": r[3], "entry_date": r[4],
-            "entry_price": safe_float(r[5]),
-            "shares": safe_int(r[6]),
-            "cost_basis": safe_float(r[7]),
-            "current_price": safe_float(r[8]),
-            "unrealized_pnl": safe_float(r[9]),
-            "unrealized_pct": safe_float(r[10]),
+            "direction": direction, "entry_date": r[4],
+            "entry_price": entry_price,
+            "shares": shares,
+            "cost_basis": cost_basis,
+            "current_price": current_price,
+            "unrealized_pnl": unrealized_pnl,
+            "unrealized_pct": unrealized_pct,
             "stop_loss": safe_float(r[11]),
             "take_profit": safe_float(r[12]),
             "trailing_stop_pct": safe_float(r[13]),
@@ -339,10 +374,11 @@ def load_data():
         })
 
     # ── Compute portfolio state ──────────────────────────────────────────────
+    total_unrealized_pnl = sum(p["unrealized_pnl"] for p in positions)
     positions_value = sum(p["cost_basis"] for p in positions)
     realized_pnl = sum(t["realized_pnl"] for t in closed_trades)
     cash = starting_capital - positions_value + realized_pnl
-    total_value = cash + positions_value
+    total_value = cash + positions_value + total_unrealized_pnl
     total_pnl = total_value - starting_capital
     total_pnl_pct = (total_pnl / starting_capital * 100) if starting_capital else 0
 
@@ -480,13 +516,34 @@ left, right = st.columns([3, 2], gap="large")
 # ─────────────────────────────────────────────────────────────────────────────
 
 with left:
+    with st.expander("🔍 Live Ticker Search", expanded=True):
+        sc1, sc2, sc3 = st.columns([1.5, 1, 1.5])
+        search_ticker = sc1.text_input("Lookup Ticker", placeholder="AAPL", key="live_search").strip().upper()
+        
+        search_price = 0.0
+        if search_ticker:
+            try:
+                import yfinance as yf
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    t = yf.Ticker(search_ticker)
+                    last_price = t.fast_info.last_price
+                    if last_price:
+                        search_price = float(last_price)
+                        sc2.metric(f"{search_ticker}", fmt_usd(search_price))
+                    else:
+                        sc2.error("No data")
+            except Exception:
+                sc2.error("Not found")
+
     with st.expander("⚡ Enter New Trade", expanded=True):
-        with st.form("new_trade_form", clear_on_submit=True):
+        with st.form("new_trade_form", clear_on_submit=False):
             st.markdown('<div class="section-header">Position Details</div>', unsafe_allow_html=True)
             c1, c2, c3, c4 = st.columns(4)
-            ticker = c1.text_input("Ticker *", placeholder="AAPL").strip().upper()
+            ticker = c1.text_input("Ticker *", value=search_ticker, placeholder="AAPL").strip().upper()
             direction = c2.selectbox("Direction", ["LONG", "SHORT"])
-            entry_price = c3.number_input("Entry Price *", min_value=0.01, step=0.01, format="%.2f")
+            entry_price = c3.number_input("Entry Price *", value=search_price if search_price > 0 else 0.0, min_value=0.00, step=0.01, format="%.2f")
             shares = c4.number_input("Shares *", min_value=1, step=1)
 
             st.markdown('<div class="section-header" style="margin-top:0.5rem">Risk Management</div>', unsafe_allow_html=True)
@@ -590,7 +647,7 @@ with left:
                         <span style="font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:700;color:#e2e8f0">{dir_icon} {p['ticker']}</span>
                         <span style="color:#6b7185;font-size:0.8rem;margin-left:10px">{p['company']}</span>
                         &nbsp;&nbsp;
-                        <span style="font-family:'JetBrains Mono',monospace;font-size:0.82rem;color:#9aa0b0">Entry {fmt_usd(p['entry_price'])} · {int(p['shares'])} shares · Cost {fmt_usd(p['cost_basis'])}</span>
+                        <span style="font-family:'JetBrains Mono',monospace;font-size:0.82rem;color:#9aa0b0">Entry {fmt_usd(p['entry_price'])} · Current {fmt_usd(p['current_price'])} · {int(p['shares'])} shares · Cost {fmt_usd(p['cost_basis'])}</span>
                         &nbsp;&nbsp;
                         <span style="font-family:'JetBrains Mono',monospace;font-size:0.9rem;font-weight:600;color:{pnl_color_pos}">
                             {'+' if p['unrealized_pnl'] >= 0 else ''}{fmt_usd(p['unrealized_pnl'])} ({fmt_pct(p['unrealized_pct'])})
