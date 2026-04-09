@@ -186,7 +186,7 @@ def crossover_triggered(direction: str, entry_price: float, live_price: float) -
         return False
     if direction == "LONG":
         return live_price >= entry_price
-    else:  # SHORT
+    else:
         return live_price <= entry_price
 
 
@@ -205,39 +205,42 @@ def load_data():
     exp_start = settings.get("experiment_start", today_str())
     exp_end = settings.get("experiment_end", "")
 
-    open_rows = sh.get_sheet_data("Open Positions")
-    closed_rows = sh.get_sheet_data("Closed Trades")
+    # ── Live Prices: read from 'Live Prices' tab (updated every 15 min by script)
+    # Priority: Live Prices tab → col 9 of Open Positions row → entry_price fallback
+    live_prices_map = sh.get_live_prices()  # {"AAPL": 182.45, "TSM": 157.30, ...}
+
+    open_rows    = sh.get_sheet_data("Open Positions")
+    closed_rows  = sh.get_sheet_data("Closed Trades")
     history_rows = sh.get_sheet_data("Portfolio History")
 
-    # ── Parse all open rows; auto-promote pending → active on crossover ─────
-    # Live prices come from column 9 (r[8]) — updated by your external 15-min
-    # price script. We do NOT re-fetch via yfinance here so the crossover check
-    # is always based on the same data source as the sheet.
-    auto_activated = []  # track which rows were auto-promoted this load
-
-    positions = []       # active trades — count toward portfolio
-    pending_positions = []  # pending trades — shown but excluded from math
+    auto_activated   = []
+    positions        = []   # active — count toward portfolio
+    pending_positions = []  # pending — excluded from math
 
     for sheet_idx, r in enumerate(open_rows):
         while len(r) < 21:
             r.append("")
 
-        status = r[20].strip().lower() if r[20].strip() else "pending"
-
+        status     = r[20].strip().lower() if r[20].strip() else "pending"
         ticker     = r[1].strip().upper()
         direction  = r[3]
         entry_price = safe_float(r[5])
         shares     = safe_int(r[6])
         cost_basis = safe_float(r[7])
-        # Column 9 (r[8]) = live price maintained by your external script
-        live_price = safe_float(r[8], default=entry_price)
+
+        # ── Live price lookup: Live Prices tab → col 9 seed → entry_price
+        live_price = (
+            live_prices_map.get(ticker)
+            or safe_float(r[8], default=0.0)
+            or entry_price
+        )
 
         # Auto-promote pending → active if crossover triggered
         if status == "pending" and crossover_triggered(direction, entry_price, live_price):
             status = "active"
             auto_activated.append((sheet_idx, r, live_price))
 
-        # Calculate unrealized PnL dynamically using live price
+        # Unrealized PnL uses the same live price
         if direction == "LONG":
             unrealized_pnl = (live_price - entry_price) * shares
         else:
@@ -245,22 +248,28 @@ def load_data():
         unrealized_pct = (unrealized_pnl / cost_basis * 100) if cost_basis > 0 else 0.0
 
         record = {
-            "trade_id": r[0], "ticker": r[1], "company": r[2],
-            "direction": direction, "entry_date": r[4],
-            "entry_price": entry_price,
-            "shares": shares,
-            "cost_basis": cost_basis,
-            "current_price": live_price,
-            "unrealized_pnl": unrealized_pnl,
-            "unrealized_pct": unrealized_pct,
-            "stop_loss": safe_float(r[11]),
-            "take_profit": safe_float(r[12]),
+            "trade_id":           r[0],
+            "ticker":             r[1],
+            "company":            r[2],
+            "direction":          direction,
+            "entry_date":         r[4],
+            "entry_price":        entry_price,
+            "shares":             shares,
+            "cost_basis":         cost_basis,
+            "current_price":      live_price,   # ← always from Live Prices tab now
+            "unrealized_pnl":     unrealized_pnl,
+            "unrealized_pct":     unrealized_pct,
+            "stop_loss":          safe_float(r[11]),
+            "take_profit":        safe_float(r[12]),
             "trailing_stop_pct": safe_float(r[13]),
-            "expiration_date": r[14],
-            "thesis": r[15], "source": r[16],
-            "insider_name": r[17], "insider_role": r[18], "filing_url": r[19],
-            "status": status,
-            "sheet_idx": sheet_idx,  # preserve for sheet writes
+            "expiration_date":    r[14],
+            "thesis":             r[15],
+            "source":             r[16],
+            "insider_name":       r[17],
+            "insider_role":       r[18],
+            "filing_url":         r[19],
+            "status":             status,
+            "sheet_idx":          sheet_idx,
         }
 
         if status == "pending":
@@ -268,7 +277,7 @@ def load_data():
         else:
             positions.append(record)
 
-    # Write auto-activations back to the sheet in bulk
+    # Write auto-activations back to sheet (best-effort)
     for sheet_idx, r, live_price in auto_activated:
         try:
             updated = list(r[:20]) + ["active"]
@@ -278,25 +287,25 @@ def load_data():
                 f"Live price {live_price} crossed entry {safe_float(r[5])} → status set to active"
             ])
         except Exception:
-            pass  # best-effort; will retry on next load
+            pass
 
     closed_trades = []
     for r in closed_rows:
         while len(r) < 20:
             r.append("")
         closed_trades.append({
-            "trade_id": r[0], "ticker": r[1], "company": r[2],
-            "direction": r[3], "entry_date": r[4],
-            "entry_price": safe_float(r[5]),
-            "exit_date": r[6], "exit_price": safe_float(r[7]),
-            "shares": safe_int(r[8]),
+            "trade_id":     r[0], "ticker": r[1], "company": r[2],
+            "direction":    r[3], "entry_date": r[4],
+            "entry_price":  safe_float(r[5]),
+            "exit_date":    r[6], "exit_price": safe_float(r[7]),
+            "shares":       safe_int(r[8]),
             "realized_pnl": safe_float(r[9]),
             "realized_pct": safe_float(r[10]),
-            "exit_reason": r[11],
-            "days_held": safe_int(r[12]),
-            "stop_loss": safe_float(r[13]),
-            "take_profit": safe_float(r[14]),
-            "thesis": r[15], "source": r[16],
+            "exit_reason":  r[11],
+            "days_held":    safe_int(r[12]),
+            "stop_loss":    safe_float(r[13]),
+            "take_profit":  safe_float(r[14]),
+            "thesis":       r[15], "source": r[16],
             "insider_name": r[17], "insider_role": r[18], "filing_url": r[19],
         })
 
@@ -305,14 +314,14 @@ def load_data():
         while len(r) < 9:
             r.append("")
         history.append({
-            "date": r[0], "cash": safe_float(r[1]),
+            "date":            r[0], "cash": safe_float(r[1]),
             "positions_value": safe_float(r[2]),
-            "total_value": safe_float(r[3]),
-            "total_pnl": safe_float(r[4]),
-            "total_pnl_pct": safe_float(r[5]),
-            "open_count": safe_int(r[6]),
-            "closed_count": safe_int(r[7]),
-            "win_rate": safe_float(r[8]),
+            "total_value":     safe_float(r[3]),
+            "total_pnl":       safe_float(r[4]),
+            "total_pnl_pct":   safe_float(r[5]),
+            "open_count":      safe_int(r[6]),
+            "closed_count":    safe_int(r[7]),
+            "win_rate":        safe_float(r[8]),
         })
 
     # ── Portfolio math — active positions only ─────────────────────────────
@@ -326,39 +335,40 @@ def load_data():
 
     wins   = [t for t in closed_trades if t["realized_pnl"] > 0]
     losses = [t for t in closed_trades if t["realized_pnl"] <= 0]
-    win_rate     = (len(wins) / len(closed_trades) * 100) if closed_trades else 0
-    avg_win      = (sum(t["realized_pnl"]       for t in wins)   / len(wins))   if wins   else 0
-    avg_loss     = (sum(abs(t["realized_pnl"])  for t in losses) / len(losses)) if losses else 0
-    total_win_amt  = sum(t["realized_pnl"]       for t in wins)
-    total_loss_amt = sum(abs(t["realized_pnl"])  for t in losses)
+    win_rate      = (len(wins) / len(closed_trades) * 100) if closed_trades else 0
+    avg_win       = (sum(t["realized_pnl"]      for t in wins)   / len(wins))   if wins   else 0
+    avg_loss      = (sum(abs(t["realized_pnl"]) for t in losses) / len(losses)) if losses else 0
+    total_win_amt  = sum(t["realized_pnl"]      for t in wins)
+    total_loss_amt = sum(abs(t["realized_pnl"]) for t in losses)
     profit_factor  = (total_win_amt / total_loss_amt) if total_loss_amt > 0 else (float("inf") if total_win_amt > 0 else 0)
     best    = max(closed_trades, key=lambda t: t["realized_pnl"],  default=None)
     worst   = min(closed_trades, key=lambda t: t["realized_pnl"],  default=None)
     avg_days = (sum(t["days_held"] for t in closed_trades) / len(closed_trades)) if closed_trades else 0
 
     return {
-        "settings": settings,
+        "settings":          settings,
         "starting_capital": starting_capital,
-        "default_stop_pct": default_stop_pct,
+        "default_stop_pct":  default_stop_pct,
         "default_target_pct": default_target_pct,
-        "default_exp_days": default_exp_days,
-        "max_position_pct": max_position_pct,
+        "default_exp_days":  default_exp_days,
+        "max_position_pct":  max_position_pct,
         "exp_start": exp_start, "exp_end": exp_end,
-        "positions": positions,
-        "pending_positions": pending_positions,
-        "closed_trades": closed_trades,
-        "history": history,
-        "cash": cash,
-        "positions_value": positions_value,
-        "total_value": total_value,
-        "total_pnl": total_pnl,
-        "total_pnl_pct": total_pnl_pct,
-        "win_rate": win_rate,
+        "positions":          positions,
+        "pending_positions":  pending_positions,
+        "closed_trades":      closed_trades,
+        "history":            history,
+        "cash":               cash,
+        "positions_value":    positions_value,
+        "total_value":        total_value,
+        "total_pnl":          total_pnl,
+        "total_pnl_pct":      total_pnl_pct,
+        "win_rate":           win_rate,
         "avg_win": avg_win, "avg_loss": avg_loss,
-        "profit_factor": profit_factor,
+        "profit_factor":      profit_factor,
         "best_trade": best, "worst_trade": worst,
-        "avg_days": avg_days,
+        "avg_days":           avg_days,
         "wins": len(wins), "losses": len(losses),
+        "live_prices_loaded": len(live_prices_map),  # for debug badge
     }
 
 
@@ -390,10 +400,18 @@ with col_title:
 with col_badge:
     st.markdown('<div style="padding-top:4px"><span class="paper-badge">PAPER TRADING</span></div>', unsafe_allow_html=True)
 with col_day:
-    st.markdown(f'<div class="day-counter" style="padding-top:6px">Day {day_num}/90 · {exp_start} → {d["exp_end"]}</div>', unsafe_allow_html=True)
+    prices_badge = (
+        f'<span style="font-size:0.7rem;color:#00d4aa;margin-left:8px">✓ {d["live_prices_loaded"]} prices loaded</span>'
+        if d["live_prices_loaded"] > 0
+        else '<span style="font-size:0.7rem;color:#ff6b6b;margin-left:8px">⚠ Live Prices tab empty</span>'
+    )
+    st.markdown(
+        f'<div class="day-counter" style="padding-top:6px">Day {day_num}/90 · {exp_start} → {d["exp_end"]}'
+        f'{prices_badge}</div>',
+        unsafe_allow_html=True,
+    )
 with col_refresh:
     if st.button("↺ Refresh", use_container_width=True):
-        # Clear ALL caches — data, resource (sheet connection), and price caches
         st.cache_data.clear()
         st.cache_resource.clear()
         st.rerun()
@@ -527,8 +545,8 @@ with left:
             if shares <= 0:       errors.append("Shares must be > 0.")
 
             cost_basis        = entry_price * shares
-            positions_val     = sum(p["cost_basis"]    for p in d["positions"])
-            realized_pnl_calc = sum(t["realized_pnl"]  for t in d["closed_trades"])
+            positions_val     = sum(p["cost_basis"]   for p in d["positions"])
+            realized_pnl_calc = sum(t["realized_pnl"] for t in d["closed_trades"])
             avail_cash        = d["starting_capital"] - positions_val + realized_pnl_calc
             total_val         = avail_cash + positions_val
             max_pos           = total_val * (d["max_position_pct"] / 100)
@@ -550,17 +568,16 @@ with left:
                     else entry_price * (1 - d["default_target_pct"] / 100)
                 )
                 trade_id = generate_trade_id()
-                # All new trades start as PENDING — auto-activated on crossover
                 row = [
                     trade_id, ticker, company, direction, today_str(),
                     entry_price, int(shares), round(cost_basis, 2),
-                    entry_price,  # col 9: current_price (seed with entry; your script updates)
+                    entry_price,  # col 9: seed with entry price; Live Prices tab takes precedence
                     0.0, 0.0,
                     round(sl, 2), round(tp, 2),
                     round(trailing_stop, 1) if trailing_stop > 0 else "",
                     exp_date.isoformat(),
                     thesis, source, insider_name, insider_role, filing_url,
-                    "pending",  # col 21: status — always starts pending
+                    "pending",
                 ]
                 try:
                     sh.append_row("Open Positions", row)
@@ -713,7 +730,6 @@ with left:
             exp_warn  = "⚠️ " if exp_days_left is not None and exp_days_left <= 5 else ""
             exp_text  = f"{exp_warn}{p['expiration_date']} ({exp_days_left}d left)" if exp_days_left is not None else p["expiration_date"]
 
-            # Show crossover target clearly
             crossover_label = (
                 f"Waiting for live price to rise to ${p['entry_price']:.2f}"
                 if p["direction"] == "LONG"

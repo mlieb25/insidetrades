@@ -32,7 +32,7 @@ def get_client() -> gspread.Client:
     except (KeyError, FileNotFoundError):
         pass
 
-    # ── Option B: Local service account JSON file ───────────────────────────
+    # ── Option B: Local service account JSON file ─────────────────────────
     creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
     if creds_path and os.path.exists(creds_path):
         creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
@@ -51,7 +51,7 @@ def get_spreadsheet() -> gspread.Spreadsheet:
     return get_client().open_by_key(SPREADSHEET_ID)
 
 
-# ── Low-level helpers (mirror server.js) ────────────────────────────────────
+# ── Low-level helpers ──────────────────────────────────────────────────────
 
 def get_sheet_data(sheet_name: str) -> list:
     """Return all data rows (excluding header) for a given sheet tab."""
@@ -63,6 +63,34 @@ def get_sheet_data(sheet_name: str) -> list:
 def get_settings() -> dict:
     rows = get_sheet_data("Settings")
     return {r[0]: r[1] for r in rows if r and r[0]}
+
+
+def get_live_prices() -> dict:
+    """
+    Read the 'Live Prices' tab and return a dict of {TICKER: float(price)}.
+
+    Expected sheet layout (row 1 = header, then one row per ticker):
+        Col A: Ticker   Col B: Price   (Col C+: optional metadata)
+
+    Falls back to an empty dict if the tab doesn't exist or can't be read,
+    so the rest of load_data() can degrade gracefully to the seed price in
+    col 9 of Open Positions.
+    """
+    try:
+        rows = get_sheet_data("Live Prices")
+        prices = {}
+        for r in rows:
+            if not r or not r[0].strip():
+                continue
+            ticker = r[0].strip().upper()
+            try:
+                price = float(str(r[1]).replace(",", "").replace("$", ""))
+                prices[ticker] = price
+            except (IndexError, ValueError):
+                pass
+        return prices
+    except Exception:
+        return {}
 
 
 def append_row(sheet_name: str, values: list) -> None:
